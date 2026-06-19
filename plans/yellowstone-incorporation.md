@@ -1,215 +1,237 @@
 # Incorporating Yellowstone's RTSP/RTP knowledge into our Deno client
 
-**Status:** proposal for review — nothing here is implemented yet.
+**Status:** proposal for review — nothing here is implemented yet. *Hold for
+review before building.*
 **Author:** Claude (with two exploration sub-agents).
 **Reference:** [GyeongHoKim/yellowstone](https://github.com/GyeongHoKim/yellowstone),
 cloned to a scratchpad and read in full (`lib/RTSPClient.ts`, `lib/util.ts`,
 `lib/transports/RTPPacket.ts`, `lib/transports/H264Transport.ts`).
 
+**Decisions locked in for this revision** (from review):
+1. Layout: **`packages/` + `apps/`** workspace.
+2. SDP: **incorporate `npm:sdp-transform`** (adopt Yellowstone's choice).
+3. Auth: **scaffold it** — and a faithful port gives us Yellowstone's Basic +
+   Digest for free, along with its UDP transport.
+4. **Adopt Yellowstone's choices in most places.** It is battle-tested; where it
+   diverges from the letter of the RFC, assume that divergence has _not mattered
+   in real use_ until a probe or a decode failure proves otherwise.
+
 ---
 
-## 1. TL;DR — what we learned
+## 1. Framing: a faithful port first, fixes second
 
-Yellowstone is a battle-tested Node RTSP client. But after auditing both
-codebases side by side, the headline is counterintuitive:
+Yellowstone is a mature, real-world RTSP client. Our earlier audit flagged
+several places where it diverges from the RFC — a fixed-size RTP extension
+assumption, padding it never trims, a STAP-A loop that can clip the last NAL,
+RTCP length/ssrc shift math. **The important context: none of those have caused
+problems in Yellowstone's years of production use.** Real cameras rarely set the
+extension bit, rarely pad, and the affected paths are edge cases. So we will
+**not** pre-emptively "correct" Yellowstone on the way in.
 
-> **Our hand-written parsing is _more_ correct than Yellowstone's in several
-> spots. Yellowstone's value to us is its _architecture_, not its bit-twiddling.**
+Instead we split the incorporation into **two committed states** so we can build
+and trial each against the actual plotter and keep whichever is more robust:
 
-Where **we are already better** (keep ours, do not regress):
+> **Phase B — Faithful Deno port.** Bring Yellowstone's RTSP/RTP/RTCP transport
+> and H.264 depacketization across *mechanically*: swap Node APIs for their Deno
+> equivalents and **change nothing else**. Quirks preserved on purpose. **Commit.**
+>
+> **Phase C — Oversight fixes.** Layer our corrections (variable-length
+> extension, padding trim, STAP-A tail, FU-A reset, RTCP math, timestamp-change
+> AU delimiting, anchored resync) **on top** of the faithful port. **Commit.**
 
-| Concern | Yellowstone | Us |
-|---|---|---|
-| RTP extension header | assumes fixed 4 bytes (`hasExt ? 16 : 12`) — **bug** for any packet with X set (`util.ts:34`) | reads the real `extWords` length and skips `4 + extWords*4` (`rtp.ts:24-27`) ✅ |
-| RTP padding | computed but **never trimmed** from payload (`util.ts:33-36`) | trims `end -= lastByte` (`rtp.ts:29`) ✅ |
-| STAP-A tail | loop bound `ptr+2 < len-1` can **drop the last NAL** (`H264Transport.ts:96`) | `off+2 <= len` reads every NAL (`depacketizer.ts:41`) ✅ |
-| Output format | Annex-B start codes (for `.264` files) | AVCC length-prefix (for WebCodecs) ✅ correct for our target |
-| Param sets | forwards SPS/PPS/AUD inline | drops 7/8/9, delivers out-of-band in avcC ✅ correct for WebCodecs |
+Two commits → two `deno compile` binaries → A/B against the device. If the
+faithful port is already rock-solid on this hardware, we may not even need
+Phase C; if Phase C is cleaner, we keep it. The git history makes the choice
+reversible and the comparison honest.
 
-Where **Yellowstone is better** (adopt its approach):
+What is **out of scope** (a scope decision, not a "fix") — the MFD is an H.264
+video display, so we omit Yellowstone's AAC/ONVIF-metadata/AV1/H265/H266
+transports and the audio backchannel (`RTPPacket.ts`). We port the H.264 path,
+the framing core, RTCP, keepalive, auth, and the UDP/TCP transports.
 
-| Concern | Yellowstone | Us (today) |
-|---|---|---|
-| **Interleaved framing** | a true byte-by-byte **state machine** (`_onData`, `ReadStates`) that cleanly demuxes `$`-binary vs `RTSP/` text on one socket | a heuristic (`runVideoLoop`) that sniffs `buf[0]` each iteration and re-aligns on a **single CRLF** — **permanently desyncs** if a `0x0d0a` appears inside an H.264 payload |
-| **RTCP** | parses RTCP, sends empty **Receiver Reports** back (keeps servers happy / NAT open) | ignores channel 1 entirely |
-| **Keepalive** | `OPTIONS` every 20 s with the `Session` id | none — long sessions may time out |
-| **Session/TEARDOWN** | captures `Session`, strips params, reuses on PLAY/PAUSE/TEARDOWN/keepalive | captures Session, but no keepalive and minimal lifecycle |
-| **Auth** | Basic + Digest (MD5/SHA-256) challenge/response | none |
-| **UDP fallback** | full `dgram` RTP/RTCP path | TCP-interleaved only |
+### What "Node→Deno substitution" means (the Phase B rulebook)
 
-Plus bugs **we already know about** in our own code, independent of Yellowstone:
-1. FU-A `this.fu` is **not reset** on a timestamp-change flush — a lost end
-   fragment splices NALs across access-unit boundaries (`depacketizer.ts:32`).
-2. `main.ts` `firstTs` / `started` are **module globals** — a second WebSocket
-   connection never re-arms the keyframe gate or the timestamp anchor.
-3. `main.ts` non-WS branch returns the literal string `"video relay"` and
-   **never serves `frontend/index.html`**.
-4. Heavy **duplication**: the `$`-frame loop exists in 3 places, `parseRtp` and
-   the SDP scanner in 2 each (`src/` vs `scripts/`).
+Mechanical swaps only — no behavioral edits:
 
-**Conclusion:** the work is (a) restructure into a real Deno workspace so there
-is _one_ trusted library, (b) graft Yellowstone's framing/RTCP/keepalive/auth
-architecture onto our correct parsing core, (c) fix our four known bugs, (d)
-delete the duplication. All of this is device-independent and can proceed before
-the probe results come back; only auth and the UDP fallback are gated on probes.
+| Node (Yellowstone) | Deno (Phase B) |
+|---|---|
+| `net.connect` / `net.Socket` | `Deno.connect({ transport: "tcp" })`, read via `conn.readable` reader, write via `conn.write` |
+| `tls.connect` | `Deno.connectTls` |
+| `dgram` UDP | `Deno.listenDatagram` / `Deno.DatagramConn` |
+| `EventEmitter` | tiny `EventTarget`-based emitter shim preserving `.on/.emit/.removeListener` |
+| `Buffer` | `Uint8Array` + `DataView` (watch `Buffer.slice`=view vs `Uint8Array.slice`=copy → use `subarray`) |
+| `crypto.createHash` (MD5/SHA-256) | `jsr:@std/crypto` (`digest` supports MD5; Web Crypto alone lacks MD5) |
+| `sdp-transform` (npm) | **`npm:sdp-transform`** — keep, per decision #2 |
+| `url.parse` | WHATWG `new URL()` |
+| `stream.Writable` sink | replaced by our AU callback (target adaptation — see API note below) |
+
+The one **non-mechanical** allowance in Phase B is the *output sink*:
+Yellowstone's `H264Transport` writes Annex-B NALs to a `.264` file; our consumer
+is WebCodecs over a WebSocket. That is a target requirement, not an oversight, so
+both phases share a stable library API and only the relay-facing packaging lives
+in the app:
+
+```ts
+// @navicoos/rtsp public contract — identical across Phase B and Phase C
+onAccessUnit(nals: Uint8Array[], meta: { marker: boolean; timestamp: number; isKeyframe: boolean }): void
+```
+
+Phase B fills `nals` exactly the way Yellowstone's `processRTPFrame` does
+(marker-bit grouping, its STAP-A bound, its FU-A reassembly, no SPS/PPS/AUD
+filtering). The **relay** (in `apps/`) does the AVCC length-prefixing, the
+SPS/PPS/AUD drop, and the WebCodecs wire framing — unchanged between phases. So
+when we A/B, the only variable is the library internals. Phase C swaps those
+internals without touching the contract or the relay.
 
 ---
 
 ## 2. Target monorepo structure
 
-Today the repo is a **single package** — one root `deno.json`, everything under
-`src/` + `scripts/`, no `workspace` key. The biggest structural problem is that
-the probes deliberately **re-implement** the RTSP/RTP/SDP logic instead of
-importing it (because `src/` was stubbed when they were written). That rationale
-is gone; we want one library both the relay and the probes consume.
-
-Proposed Deno **workspace** layout (`"workspace"` member list in the root
-`deno.json`):
+Today: a **single package** (one root `deno.json`, no `workspace` key), and the
+probes deliberately *re-implement* RTSP/RTP/SDP because `src/` was stubbed when
+they were written. We collapse that into one tested library.
 
 ```
 navicoos-remote-client/
-├── deno.json                 # workspace root: members[], shared fmt/lint, top-level tasks
+├── deno.json                 # workspace root: members[], shared fmt/lint, tasks
 ├── packages/
-│   └── rtsp/                 # @navicoos/rtsp — the reusable, Deno-native core (NEW home)
-│       ├── deno.json         #   name + exports map
-│       ├── mod.ts            #   public barrel
-│       ├── rtp.ts            #   ← src/rtp.ts (already correct; keep)
-│       ├── rtcp.ts           #   NEW: parse RTCP + build empty Receiver Report
-│       ├── sdp.ts            #   ← src/sdp.ts (hardened; in-band SPS/PPS fallback)
-│       ├── depacketizer.ts   #   ← src/depacketizer.ts (FU-A reset fix)
-│       ├── framing.ts        #   NEW: Yellowstone-style $-frame/RTSP-text state machine
-│       ├── transport.ts      #   NEW: injectable socket iface (Deno.connect behind it)
-│       ├── rtsp_client.ts    #   ← src/rtsp_client.ts (uses framing.ts + transport.ts)
-│       ├── auth.ts           #   NEW (probe-gated): Basic/Digest
-│       ├── types.ts          #   ← src/types.ts
-│       └── *_test.ts         #   NEW: unit tests over captured byte fixtures
+│   └── rtsp/                 # @navicoos/rtsp — Deno-native RTSP/RTP/H264 core
+│       ├── deno.json         #   name + exports; dep: npm:sdp-transform, jsr:@std/crypto
+│       ├── mod.ts            #   public barrel (stable across Phase B/C)
+│       ├── rtsp_client.ts    #   ← port of Yellowstone RTSPClient (_onData state machine)
+│       ├── rtp.ts            #   ← port of util.parseRTPPacket
+│       ├── rtcp.ts           #   ← port of util.parseRTCPPacket + empty Receiver Report
+│       ├── depacketizer.ts   #   ← port of H264Transport.processRTPFrame (emits nals[])
+│       ├── sdp.ts            #   ← Yellowstone SDP handling via npm:sdp-transform
+│       ├── transport.ts      #   injectable socket iface (TCP/TLS/UDP behind Deno APIs)
+│       ├── auth.ts           #   ← port of Basic/Digest (_generateAuthString)
+│       ├── emitter.ts        #   EventTarget-based EventEmitter shim
+│       ├── types.ts
+│       └── *_test.ts         #   characterization tests (Phase B) → correctness tests (Phase C)
 ├── apps/
 │   └── relay/                # @navicoos/relay — the application shell
 │       ├── deno.json
-│       ├── main.ts           #   ← src/main.ts (per-conn state; serves frontend)
+│       ├── main.ts           #   Deno.serve WS relay; AVCC packaging; per-conn state; serves frontend
 │       └── frontend/         #   ← frontend/ (index.html, decoder.js)
-├── scripts/                  # probes — now IMPORT @navicoos/rtsp instead of _rtsp.ts
-│   ├── probe_transport.ts
-│   └── probe_stream.ts
+├── scripts/                  # probes — now import @navicoos/rtsp (delete _rtsp.ts)
 ├── plans/                    # this document
-└── reference-client/         # untouched Python (already excluded from fmt/lint)
+└── reference-client/         # untouched Python
 ```
 
-Why a workspace and not just folders:
-- **One source of truth.** `framing.ts`, `parseRtp`, the SDP scanner, and the
-  NAL classifier collapse from 2–3 copies to one. `scripts/_rtsp.ts` is deleted.
-- **Testability.** `packages/rtsp` becomes pure/portable enough to unit-test
-  with `deno test` over recorded byte fixtures (no live device needed) — the
-  state machine and depacketizer are exactly the kind of code that needs tests.
-- **Clean compile target.** `apps/relay` is the only thing that imports
-  `Deno.serve`/`Deno.upgradeWebSocket`; `deno compile` stays pointed at it.
-- **Dependency hygiene.** The library can stay **zero-dependency** (we keep our
-  hand-rolled SDP rather than pulling Yellowstone's `npm:sdp-transform`), which
-  keeps the compiled binary self-contained.
-
-### Effect on `deno.json` / packages
-- Root `deno.json` gains `"workspace": ["packages/rtsp", "apps/relay"]`; fmt/lint
-  `include` globs widen to `packages/`, `apps/`, `scripts/`. Tasks become:
-  `start` → `apps/relay/main.ts`; `compile` → `apps/relay/main.ts`;
-  `check`/`test` → workspace-wide; `probe:*` unchanged paths.
-- `packages/rtsp/deno.json` declares `"name": "@navicoos/rtsp"` and an
-  `"exports"` map so `apps/relay` and `scripts/` import `@navicoos/rtsp` by name.
-- **No new third-party packages** in the default plan. Two _optional, deferred_
-  std deps, only if probes prove them necessary: `jsr:@std/crypto` (MD5 for
-  Digest auth — Web Crypto has no MD5) and `jsr:@std/encoding/base64` (if we
-  stop relying on `atob`). Both are std, both stay out unless required.
+Effect on config / packages:
+- Root `deno.json`: add `"workspace": ["packages/rtsp", "apps/relay"]`; widen
+  fmt/lint `include` to `packages/`, `apps/`, `scripts/`; tasks `start`/`compile`
+  → `apps/relay/main.ts`, `check`/`test` → workspace-wide, `probe:*` unchanged.
+- `packages/rtsp/deno.json`: `"name": "@navicoos/rtsp"`, an `"exports"` map, and
+  the **new dependencies** `npm:sdp-transform` and `jsr:@std/crypto`.
+- `apps/relay` is the only member importing `Deno.serve` / `Deno.upgradeWebSocket`
+  → `deno compile` stays pointed there.
+- Probes drop their private protocol copies and import `@navicoos/rtsp`;
+  `scripts/_rtsp.ts` is deleted.
 
 ---
 
-## 3. How the sonnet agents do the work
+## 3. Phased agent execution
 
-Each wave is one focused **sonnet** sub-agent with a tight brief, fixture-backed
-where possible, and a hard gate: it must leave `deno task check`, `deno task
-lint`, and (from Wave 1 on) `deno task test` green before I review and commit.
-I orchestrate, review every diff, and own the commits/pushes to
-`claude/charming-planck-ggb378` (updating PR #1).
+Each wave is one focused **sonnet** sub-agent with a tight brief, gated on
+`deno task check` + `lint` + (from Phase B on) `test` staying green. I
+orchestrate, review every diff, and own commits/pushes to
+`claude/charming-planck-ggb378` (PR #1).
 
-**Wave 0 — Workspace scaffold (no logic changes).**
-Move files with `git mv` into `packages/rtsp` + `apps/relay`, add the workspace
-`deno.json`s, fix import specifiers, prove `deno task check` still passes. Small
-enough that I may do it directly rather than spawn an agent.
+### Phase A — Workspace scaffold (structural; no protocol logic)
+Stand up `packages/rtsp` + `apps/relay`, the root workspace `deno.json`, the
+`npm:sdp-transform` / `jsr:@std/crypto` deps, and move `frontend/` under the
+relay. `git mv` where possible; prove `deno task check` passes. Small — likely
+done directly rather than via agent. **No commit boundary of its own; folds into
+Phase B's first commit** (or a trivial "scaffold workspace" commit if large).
 
-**Wave 1 — Library core + tests (device-independent).**
-Agent: relocate `rtp.ts`/`depacketizer.ts`/`sdp.ts`/`types.ts` into the package
-and write `deno test` suites over **captured byte fixtures** (hand-built RTP
-packets: single NAL, STAP-A with a tail NAL, multi-packet FU-A, a packet with an
-extension header + padding to lock in our correctness advantage over
-Yellowstone). Fix the **FU-A dangling bug** here (reset `this.fu` on
-timestamp-change flush and AU boundary) with a regression test for the
-lost-end-fragment case.
+### Phase B — Faithful Deno port  → **commit**
+Mechanical Node→Deno port per the §1 rulebook, quirks preserved.
 
-**Wave 2 — Framing state machine + transport abstraction (the big one).**
-Agent: port Yellowstone's `_onData` `ReadStates` machine to Deno as
-`framing.ts` — a push-driven parser (`feed(chunk) -> events`) that demuxes
-`$`-binary frames from `RTSP/` text using **two legal lead bytes only** (`0x24`
-/ `0x52`) and `\r\n\r\n` (not a single CRLF) as the text terminator, with an
-anchored resync instead of a throw. Introduce `transport.ts` (an injectable
-socket interface) so the client logic is testable without a real socket, and
-rewrite `rtsp_client.ts`'s read loop on top of `framing.ts`. Retire the
-`runVideoLoop` heuristic. Tests: feed adversarial chunks (CRLF inside a payload,
-a frame split across two `feed()` calls, an interleaved keepalive response).
+- **B1 — `emitter.ts` + `transport.ts`.** EventEmitter shim; injectable
+  TCP/TLS/UDP socket interface backed by `Deno.connect`/`connectTls`/
+  `listenDatagram`.
+- **B2 — `rtp.ts` + `rtcp.ts`.** Port `parseRTPPacket` and `parseRTCPPacket`
+  *verbatim in behavior* (yes, including the fixed-extension assumption, the
+  un-trimmed padding, and the RTCP shift math). `Buffer`→`DataView`.
+- **B3 — `rtsp_client.ts`.** Port the `_onData` `ReadStates` state machine, the
+  request/response engine, SETUP/PLAY/PAUSE/TEARDOWN, the **20 s OPTIONS
+  keepalive**, **Session** handling, the **RTCP Receiver-Report reply**, and both
+  the **TCP-interleaved and UDP** transports. `String.fromCharCode.apply` ported
+  as-is for now (TextDecoder is a Phase-C fix).
+- **B4 — `auth.ts`.** Port Basic + Digest (MD5/SHA-256) challenge/response via
+  `jsr:@std/crypto`.
+- **B5 — `sdp.ts` + `depacketizer.ts`.** SDP via `npm:sdp-transform` (mirroring
+  Yellowstone's `parse`/`parseParams` usage); depacketizer reproduces
+  `processRTPFrame` exactly but emits `nals[]` through the stable callback
+  instead of writing Annex-B to a file.
+- **B6 — relay wiring (`apps/relay/main.ts`).** Enough to *run and trial*:
+  consume `onAccessUnit`, do AVCC packaging + SPS/PPS/AUD drop + WebCodecs
+  framing, **per-connection state** (no module globals), **serve the frontend**,
+  `try/catch` the async chain. (These last two are our-code correctness, not
+  Yellowstone oversights, so they belong in both phases — hence here.)
+- **B7 — characterization tests.** `deno test` over captured byte fixtures
+  asserting the port reproduces Yellowstone's behavior (these document the
+  quirks; Phase C will flip the assertions to "correct").
 
-**Wave 3 — RTCP + keepalive + session lifecycle (device-independent).**
-Agent: add `rtcp.ts` (parse SR; build the empty Receiver Report), wire the
-client to **answer channel-1 RTCP with an RR**, add the **20 s OPTIONS
-keepalive** with the `Session` id, and tighten `Session`/`TEARDOWN` handling per
-Yellowstone. (Note: fix the `length`/`ssrc` shift bugs that exist in
-Yellowstone's own `parseRTCPPacket` rather than copying them.)
+Result: a working, Yellowstone-faithful `@navicoos/rtsp` driving the relay.
+**Commit** (tag, e.g. `port/faithful`).
 
-**Wave 4 — Relay app hardening (device-independent).**
-Agent: move state into **per-connection** scope (kill the `firstTs`/`started`
-module globals), **serve `frontend/index.html` + `decoder.js`** from the non-WS
-branch, add `try/catch` around the `onopen` async chain so failures close the
-socket and surface an error.
+### Phase C — Oversight fixes  → **commit**
+Layer corrections onto the ported library; relay + public API untouched.
 
-**Wave 5 — De-duplicate the probes (device-independent).**
-Agent: rewrite `probe_transport.ts` / `probe_stream.ts` to import
-`@navicoos/rtsp`; delete `scripts/_rtsp.ts`. The probes keep their _measurement_
-logic but stop carrying private copies of the protocol.
+- RTP: variable-length **extension** skip; **padding** trim.
+- RTCP: fix `length` / `ssrc` shift math.
+- Depacketizer: correct **STAP-A** tail bound + bounds check; **FU-A** reset on
+  AU boundary / timestamp change + single-fragment (`s&&e`) handling;
+  **timestamp-change AU delimiting** alongside the marker bit.
+- Framing: **anchored resync** instead of throwing on an unexpected byte;
+  `TextDecoder` for large SDP bodies.
+- Flip B7's characterization tests to correctness tests; add regression tests
+  (extension+padding packet, STAP-A tail NAL, lost FU-A end fragment).
 
-**Wave 6 — Probe-gated work (BLOCKED on device output).**
-Only after you run `deno task probe:transport` / `probe:stream` against
+**Commit** (tag, e.g. `port/fixed`).
+
+### Phase D — Probe-gated verification & tuning (BLOCKED on device output)
+After you run `deno task probe:transport` / `probe:stream` against
 `192.168.0.1:554/screenmirror`:
-- If SETUP refuses interleaving → add the **UDP `Deno.DatagramConn` fallback**.
-- If any request returns **401** → add `auth.ts` (Basic, then Digest+MD5 via
-  `jsr:@std/crypto`).
-- If SDP lacks `sprop-parameter-sets` → implement the **in-band SPS/PPS capture**
-  fallback `sdp.ts` currently only documents.
-- Marker-bit vs timestamp-change delimiting and in-band SPS/PPS frequency from
-  the stream probe confirm or adjust the depacketizer defaults.
+- **Transport** (TCP-interleaved vs UDP-only) — both paths already exist from the
+  faithful port; the probe just tells us which to default to.
+- **Auth** — if a request 401s, auth is already ported; the probe tells us
+  whether it's exercised.
+- **In-band SPS/PPS** — if SDP lacks `sprop-parameter-sets` (Yellowstone relies
+  on it too), implement first-keyframe capture. Net-new in both codebases.
+- **Marker vs timestamp delimiting** — the stream probe confirms whether Phase
+  C's timestamp fallback is load-bearing on this device.
 
 ---
 
-## 4. Sequencing & rationale
+## 4. Trialing the two builds
 
-Waves 0–5 need **no device** — they're pure robustness/structure work validated
-by unit tests and `deno check`/`lint`. They can land while we wait on probe
-output. Wave 6 is the only device-dependent piece and splits cleanly along the
-exact unknowns the two probes were written to answer (§0 transport precondition,
-auth, in-band parameter sets, marker reliability).
+The whole point of the two-commit split:
 
-Net effect on the repo: from one stubbed package with triplicated protocol code,
-to a tested zero-dependency `@navicoos/rtsp` library consumed by a thin relay app
-and by the probes — with Yellowstone's framing/RTCP/keepalive/auth architecture
-folded in and our four known bugs fixed, without regressing the three places we
-parse more correctly than Yellowstone does.
+```sh
+git checkout port/faithful && deno task compile -o relay-faithful
+git checkout port/fixed    && deno task compile -o relay-fixed
+# run each against the plotter, compare decode stability / desync / dropped frames
+```
+
+Keep whichever is more robust on real hardware; if it's a wash, keep `port/fixed`
+(strictly more RFC-correct at no observed cost). Either way the loser stays in
+history, so reverting is a `git checkout`.
 
 ---
 
-## 5. Open questions for you
+## 5. Sequencing & remaining questions
 
-1. **Layout naming:** `packages/rtsp` + `apps/relay` as above, or flatter
-   (`rtsp/` + keep the relay at root)? I lean toward `packages/` + `apps/` since
-   you called it a monorepo.
-2. **Zero-dependency stance:** keep our hand-rolled SDP (my recommendation), or
-   adopt `npm:sdp-transform` like Yellowstone for broader SDP coverage at the
-   cost of a dependency in the compiled binary?
-3. **Auth scope:** scaffold `auth.ts` now (Basic only) or leave it entirely to
-   Wave 6 pending a 401 from the probe? `/screenmirror` may well be open.
-4. **Should I start Wave 0–1 now** (device-independent, low-risk) while the probe
-   output is pending, or hold everything until you've reviewed this plan?
+Phases A–C are **device-independent** — pure structure + port + fixes, validated
+by `deno check`/`lint`/`test`. They can all land before probe output arrives.
+Phase D is the only device-gated piece, and only for *defaults and the one
+net-new in-band-SPS/PPS path* — transport, auth, and keepalive all come across in
+the faithful port.
+
+Per decision #4, I'm **holding for your review** before starting Phase A. Two
+small things worth confirming when you're ready:
+- **Tag names** for the two trial commits (`port/faithful` / `port/fixed` ok?).
+- Whether you want Phase A as its **own scaffold commit** (cleaner history) or
+  folded into the Phase B commit (fewer commits on the PR).
