@@ -130,3 +130,16 @@ dmypy.json
 
 # macOS
 .DS_Store
+
+# Deno
+# Compiled binary outputs from `deno compile`
+/main
+/navicoos-remote-client
+main.exe
+*.exe
+# Merge/patch backups (e.g. from deno fmt --check workflows)
+*.orig
+# Deno's local cache, if vendored/cached in-tree
+.deno/
+/vendor/
+deno.lock

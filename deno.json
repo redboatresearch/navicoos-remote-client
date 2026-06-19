@@ -1,0 +1,31 @@
+{
+  "tasks": {
+    "start": "deno run --allow-net src/main.ts",
+    "probe:transport": "deno run --allow-net scripts/probe_transport.ts",
+    "probe:stream": "deno run --allow-net scripts/probe_stream.ts",
+    "compile": "deno compile --allow-net src/main.ts",
+    "check": "deno check src/*.ts",
+    "fmt": "deno fmt",
+    "lint": "deno lint"
+  },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "semiColons": true,
+    "singleQuote": false,
+    "include": ["src/", "scripts/", "frontend/"],
+    "exclude": ["reference-client/"]
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    },
+    "include": ["src/", "scripts/"],
+    "exclude": ["reference-client/", "frontend/"]
+  },
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.window", "dom", "dom.iterable"]
+  }
+}
