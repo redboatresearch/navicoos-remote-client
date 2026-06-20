@@ -7,10 +7,13 @@
 // State that was formerly module-global (firstTs, started) is now per-connection
 // inside each WebSocket handler closure to support concurrent clients correctly.
 
-import { RtspClient } from "@navicoos/rtsp";
-import type { StreamConfig } from "@navicoos/rtsp";
+import { ControlClient, RtspClient } from "@navicoos/rtsp";
+import type { StreamConfig, TouchEvent } from "@navicoos/rtsp";
 
 const IP = Deno.args[0] ?? "192.168.0.1";
+// Client MAC used for the remotecontrold AUTH handshake. Overridable via the
+// CLIENT_ID env (passed as argv[1] by the s6 run script), like MFD_IP.
+const CLIENT_ID = Deno.args[1] ?? "00:11:22:33:44:55";
 const RTSP_PORT = 554;
 const STREAM_PATH = "/screenmirror";
 
@@ -81,6 +84,11 @@ Deno.serve({ port: 8080 }, (req) => {
   if (req.headers.get("upgrade") === "websocket") {
     const { socket, response } = Deno.upgradeWebSocket(req);
     const client = new RtspClient(IP, RTSP_PORT, STREAM_PATH);
+    // Control connection (remotecontrold). Lazily handshaken alongside video;
+    // null until the handshake succeeds, so input is silently dropped if the
+    // device's control port is unreachable while video still plays.
+    const control = new ControlClient(IP, CLIENT_ID);
+    let controlReady = false;
 
     socket.onopen = async () => {
       // Per-connection state — NOT module globals.
@@ -127,10 +135,54 @@ Deno.serve({ port: 8080 }, (req) => {
       } catch (err) {
         console.error("[relay] connection error:", err);
         socket.close(1011, "relay error");
+        return;
+      }
+
+      // Open the control channel independently — a control failure must not
+      // take down the (already working) video. On success, hand the frontend
+      // the device's button table + coded resolution for coord mapping.
+      try {
+        await control.connect();
+        controlReady = true;
+        socket.send(JSON.stringify({
+          type: "control",
+          buttons: control.buttons,
+          width: control.info.width,
+          height: control.info.height,
+        }));
+        console.log(
+          `[relay] control ready: ${control.info.name} (${control.info.model}), ` +
+            `${control.buttons.length} buttons, ${control.info.width}x${control.info.height}`,
+        );
+      } catch (err) {
+        console.error("[relay] control connect failed (video unaffected):", err);
       }
     };
 
-    socket.onclose = () => client.close();
+    // Browser -> relay control messages: forward touch/key to the device.
+    socket.onmessage = (ev) => {
+      if (!controlReady || typeof ev.data !== "string") return;
+      let msg: { t?: string; x?: number; y?: number; e?: number; label?: string };
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      try {
+        if (msg.t === "touch" && typeof msg.x === "number" && typeof msg.y === "number") {
+          control.sendTouch(msg.x, msg.y, (msg.e ?? 0) as TouchEvent);
+        } else if (msg.t === "key" && typeof msg.label === "string") {
+          control.pressButton(msg.label);
+        }
+      } catch (err) {
+        console.error("[relay] control send failed:", err);
+      }
+    };
+
+    socket.onclose = () => {
+      client.close();
+      control.close();
+    };
     return response;
   }
 
@@ -140,6 +192,9 @@ Deno.serve({ port: 8080 }, (req) => {
   }
   if (url.pathname === "/decoder.js") {
     return serveFrontend("decoder.js", "text/javascript");
+  }
+  if (url.pathname === "/control.js") {
+    return serveFrontend("control.js", "text/javascript");
   }
 
   return new Response("not found", { status: 404 });

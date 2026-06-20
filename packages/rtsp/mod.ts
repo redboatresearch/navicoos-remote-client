@@ -7,3 +7,5 @@
 
 export { RtspClient } from "./rtsp_client.ts";
 export type { StreamConfig } from "./types.ts";
+export { ControlClient } from "./control.ts";
+export type { DeviceButton, DeviceInfo, TouchEvent } from "./control.ts";

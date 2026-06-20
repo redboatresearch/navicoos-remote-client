@@ -4,5 +4,5 @@
 # does need the WireGuard service to have established routes by the time a
 # client connects, which s6 ordering below ensures.
 cd /app
-echo "[deno-relay] starting; target MFD ${MFD_IP}"
-exec deno run --allow-net --allow-read --no-prompt apps/relay/main.ts "${MFD_IP}"
+echo "[deno-relay] starting; target MFD ${MFD_IP} (control client-id ${CLIENT_ID:-default})"
+exec deno run --allow-net --allow-read --no-prompt apps/relay/main.ts "${MFD_IP}" "${CLIENT_ID:-00:11:22:33:44:55}"

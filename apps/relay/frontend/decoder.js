@@ -2,6 +2,8 @@
 // Receives the `config` message, builds the avcC `description`, and decodes
 // AVCC chunks to the <canvas id="video">.
 
+import { setupControls } from "./control.js";
+
 const canvas = document.getElementById("video");
 const ctx = canvas.getContext("2d");
 
@@ -120,11 +122,14 @@ ws.binaryType = "arraybuffer";
 ws.onmessage = (ev) => {
   if (typeof ev.data === "string") {
     const cfg = JSON.parse(ev.data);
-    if (cfg.type !== "config") return;
-    codecString = cfg.codec;
-    description = buildAvcc(Uint8Array.from(cfg.sps), Uint8Array.from(cfg.pps));
-    forcedSoftware = false;
-    startDecoder();
+    if (cfg.type === "config") {
+      codecString = cfg.codec;
+      description = buildAvcc(Uint8Array.from(cfg.sps), Uint8Array.from(cfg.pps));
+      forcedSoftware = false;
+      startDecoder();
+    } else if (cfg.type === "control") {
+      setupControls(canvas, ws, cfg);
+    }
     return;
   }
 

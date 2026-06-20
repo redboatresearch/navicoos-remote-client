@@ -11,7 +11,9 @@ services:
       - net.ipv4.conf.all.src_valid_mark=1
     environment:
       # IP of the chartplotter as reachable *through* the tunnel.
-      - MFD_IP=192.168.129.4
+      - MFD_IP=
+      # MAC this relay authenticates as on the MFD control port (6633).
+      - CLIENT_ID=
       - PUID=1000
       - PGID=1000
       - TZ=Etc/UTC
