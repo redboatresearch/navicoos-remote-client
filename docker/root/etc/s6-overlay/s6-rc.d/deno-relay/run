@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv bash
+# Deno RTSP->WebSocket relay. Connects to the MFD lazily when a browser opens
+# a WebSocket, so it does not need to block on the tunnel being up — but it
+# does need the WireGuard service to have established routes by the time a
+# client connects, which s6 ordering below ensures.
+cd /app
+echo "[deno-relay] starting; target MFD ${MFD_IP} (control client-id ${CLIENT_ID:-default})"
+exec deno run --allow-net --allow-read --no-prompt apps/relay/main.ts "${MFD_IP}" "${CLIENT_ID:-00:11:22:33:44:55}"

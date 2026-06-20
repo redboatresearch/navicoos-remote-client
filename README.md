@@ -1,85 +1,123 @@
-# navicoos-remote-client
+# navicoos-remote-client — Deno video client
 
-A native macOS remote display and control client for B&G Vulcan/Zeus marine chartplotter displays (and similar Navico devices).
+A standalone Deno/TypeScript video client for B&G/Navico marine chartplotters
+(MFDs). It opens the MFD's RTSP screen-mirror stream, demuxes H.264 over
+interleaved TCP, aggregates access units, and forwards them as AVCC over a
+WebSocket to a WebCodecs frontend that decodes to a `<canvas>`.
 
-This application establishes a TCP connection to send control packets (mouse clicks, dragging, hardware key presses) to the MFD, and receives an ultra low-latency RTSP video stream mirroring the display.
+This replaces the legacy mpv-based video path. The touch/key control protocol
+back to the device is handled separately by the legacy Python client (see
+[`reference-client/`](./reference-client/)).
 
+> Status: scaffolding only. The modules under `src/` are stubs — see
+> `rtsp_client_spec.md` (the spec) for the implementation to fill in.
 
-## Prerequisites
+## Layout
 
-Ensure you have Poetry installed and the required macOS libraries:
-
-```bash
-poetry install
+```
+.
+├── deno.json          # tasks, fmt/lint config, compiler options
+├── src/               # Deno client
+│   ├── main.ts        # entry point: WebSocket relay + wiring (spec §3.5)
+│   ├── rtsp_client.ts # RTSP handshake + interleaved read loop (spec §3.4)
+│   ├── rtp.ts         # RTP header parsing (spec §3.1)
+│   ├── sdp.ts         # SDP parsing -> StreamConfig (spec §3.2)
+│   ├── depacketizer.ts# NAL reassembly -> AVCC access units (spec §3.3)
+│   └── types.ts       # shared wire contracts (spec §2)
+├── frontend/          # WebCodecs decoder served to webview / remote browser
+│   ├── index.html
+│   └── decoder.js     # VideoDecoder -> canvas (spec §5)
+├── scripts/           # transport/stream verification probes (added later)
+└── reference-client/  # legacy Python remote-control + RTSP client
 ```
 
-*Note: You also need `mpv` installed on your system (e.g., `brew install mpv`).*
+## Running the dev relay
 
-## Usage
+The relay connects to the MFD over RTSP and serves a WebSocket on port 8080.
 
-Connect your Mac to the MFD's Wi-Fi network (or wired network), find the IP address of the MFD, and launch the player:
-
-```bash
-poetry run navicoos-remote-client <IP_ADDRESS>
+```sh
+deno task start <IP>     # defaults to 192.168.0.1 if omitted
 ```
 
-Optional arguments:
-- `--client-id 00:11:22:33:44:55`: Provide your Mac's MAC address to avoid authorization re-prompts on the MFD.
-- `--debug`: Enable verbose packet logging.
-- `-c`, `-r`: Override remotecontrol/RTSP ports if necessary.
+Point a browser (or the embedded webview) at the relay. Note: `VideoDecoder`
+requires a secure context — use `http://localhost` rather than a raw LAN IP
+(spec §6).
 
-When connecting to an MFD for the first time, you must tap **Accept** on the physical MFD screen to authorize the connection.
+## Probes
 
-## Keyboard Controls
+Before relying on the pure-TypeScript transport, verify the device honors RTP
+interleaved over the RTSP TCP socket (spec §0):
 
-The MFD's physical hardware buttons are mapped to your Mac's keyboard:
+```sh
+deno task probe:transport <IP>   # scripts/probe_transport.ts
+deno task probe:stream <IP>      # scripts/probe_stream.ts
+```
 
-| Mac Key | MFD Hardware Button |
-|---------|---------------------|
-| `Esc` | Pages |
-| `m` | Menu |
-| `Up Arrow` | Zoom In |
-| `Down Arrow` | Zoom Out |
-| `p` | Power |
-| `Enter` | Enter |
-| `c` | Cancel |
-| `o` | MOB |
-| `g` | Goto |
-| `a` | Mark |
-| `w` | WheelKey |
-| `q` | *Quit Client* |
+## Other tasks
 
----
+```sh
+deno task check      # type-check src/*.ts
+deno task fmt        # format
+deno task lint       # lint
+deno task compile    # build a single binary (deno compile --allow-net)
+```
 
-## Technical Protocol Analysis
+## Docker (relay behind a WireGuard tunnel)
 
-`navicoos-remote-client` implements a custom binary TCP protocol on port `6633` over which control packets are exchanged.
+To reach a chartplotter on a remote LAN, the relay runs inside a container
+based on [`linuxserver/wireguard`](https://docs.linuxserver.io/images/docker-wireguard/).
+The container brings up the WireGuard client, and an s6 service runs the Deno
+relay alongside it. The relay connects to the MFD lazily — only when a browser
+opens the WebSocket — so it reaches the device *through* the tunnel.
 
-### Packet Structure
-All packets sent and received follow a strict binary format:
-1. **Length** (2 bytes): Total length of the payload
-2. **Opcode** (2 bytes): Identifies the action type (e.g., Ping, Auth, Touch)
-3. **Payload Data**: Variable length
+```sh
+# 1. Drop your WireGuard client config in place (any *.conf name works).
+#    Start from wg0.conf.example and fill in your peer's values:
+mkdir -p wireguard
+cp wg0.conf.example wireguard/wg0.conf
+$EDITOR wireguard/wg0.conf
 
-### Handshake Sequence
-1. **Ping Request (`0x0001`)**: The client sends a hardcoded Ping ID (`0x4403D7C3`).
-2. **Ping Reply (`0x0002`)**: The MFD responds with its device identity string, software version, display resolution (e.g., 1280x720), and an array of hardware button indices mapped to numerical keycodes.
-3. **Auth Request (`0x0003`)**: The client sends its MAC address (6 bytes) and an ASCII string name (null-padded to 32 bytes, e.g., `"iPad"`).
-4. **Auth Ack (`0x0004`)**: The MFD echoes back the MAC address and an `0x01` success flag to complete the handshake. (Older versions of the script incorrectly sent additional static packets instead of waiting for this response).
+# 2. Set MFD_IP in docker-compose.yml to the chartplotter's address as seen
+#    through the tunnel (defaults to 192.168.0.1).
 
-### Interaction Packets
-* **Touch Events (`0x1001`)**:
-  Includes a 32-bit monotonic timestamp, X/Y coordinates, an event type (`0x00` = press, `0x01` = drag, `0x02` = release), and a touch count (usually `1`).
-* **Key Events (`0x1003`)**:
-  Includes the numerical keycode (derived dynamically from the Ping Reply) and a press state (`1` = press, `0` = release).
+# 3. Build and run:
+docker compose up --build
 
-### Video Stream
-The device broadcasts the screen mirror via an RTSP video stream located at `rtsp://<IP_ADDRESS>:554/screenmirror`. The client consumes this via `libmpv` configured for ultra-low latency.
+# 4. Open the relay (secure-context requirement — use localhost, not the LAN IP):
+open http://localhost:8080
+```
 
-## Acknowledgements
+### Use a split-tunnel config
 
-This project is a native macOS Cocoa rewrite and continuation based on the original [BanGPlayer](https://github.com/htool/BanGPlayer) by [htool](https://github.com/htool).
+The relay only needs to reach the chartplotter — not route all your traffic.
+Scope the peer's `AllowedIPs` to the **MFD's subnet**, and make sure `MFD_IP`
+falls inside it:
 
-## License
+```ini
+[Peer]
+AllowedIPs = 192.168.0.0/24   # the chartplotter's LAN, NOT 0.0.0.0/0
+```
 
-This project is licensed under the MIT License.
+Why this matters: `wg-quick` uses policy-based routing. With a full tunnel
+(`0.0.0.0/0`) the only route covering the relay's *replies to your browser* is
+the tunnel's default route, so the relay's `:8080` becomes unreachable from
+other machines on your LAN (it still works from `localhost` on the Docker
+host). A split tunnel adds a route only for the MFD subnet via `wg0` and leaves
+everything else on `eth0`, so the port stays reachable everywhere. This was
+verified against the container: `192.168.0.1` routes via `wg0`, `1.1.1.1` stays
+on `eth0`. See [`wg0.conf.example`](./wg0.conf.example).
+
+The `wireguard/` directory and any `*.conf` files are git-ignored and excluded
+from the build context — your keys never end up in the image. The config is
+mounted read-only at `/config/wg_confs/` at runtime. To target a different
+device without rebuilding, override the env var:
+
+```sh
+MFD_IP=10.0.0.5 docker compose up --build   # or edit docker-compose.yml
+```
+
+## Legacy Python client
+
+The original native macOS remote display + control client lives in
+[`reference-client/`](./reference-client/). It remains the reference for the
+control protocol (`core.py`) and is unaffected by this Deno project.

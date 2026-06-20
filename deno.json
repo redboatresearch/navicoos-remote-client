@@ -1,0 +1,33 @@
+{
+  "workspace": ["./packages/rtsp", "./apps/relay"],
+  "tasks": {
+    "start": "deno run --allow-net --allow-read apps/relay/main.ts",
+    "probe:transport": "deno run --allow-net scripts/probe_transport.ts",
+    "probe:stream": "deno run --allow-net scripts/probe_stream.ts",
+    "compile": "deno compile --allow-net --allow-read apps/relay/main.ts",
+    "check": "deno check packages/rtsp apps/relay/main.ts scripts",
+    "test": "deno test packages/rtsp",
+    "fmt": "deno fmt",
+    "lint": "deno lint"
+  },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "semiColons": true,
+    "singleQuote": false,
+    "include": ["packages/", "apps/", "scripts/"],
+    "exclude": ["reference-client/", "apps/relay/frontend/"]
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    },
+    "include": ["packages/", "apps/", "scripts/"],
+    "exclude": ["reference-client/", "apps/relay/frontend/"]
+  },
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.window", "dom", "dom.iterable"]
+  }
+}

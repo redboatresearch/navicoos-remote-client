@@ -1,0 +1,32 @@
+# Example WireGuard client config for the relay container.
+#
+# Copy this to wireguard/wg0.conf and fill in the real values from your peer:
+#   mkdir -p wireguard && cp wg0.conf.example wireguard/wg0.conf
+#
+# This is a SPLIT-TUNNEL config: only the chartplotter's LAN is routed through
+# the tunnel; all other traffic (including the relay's replies to your browser)
+# stays on the container's normal network. That keeps the relay's :8080 port
+# reachable while still reaching the MFD over the VPN.
+
+[Interface]
+# The address this client is assigned *inside* the tunnel (from your peer/server).
+Address = 10.13.13.2/32
+PrivateKey = <your-client-private-key>
+# Only set DNS if you need to resolve hostnames through the tunnel (usually not
+# needed — the relay talks to the MFD by IP).
+# DNS = 10.13.13.1
+
+[Peer]
+PublicKey = <server-public-key>
+# PresharedKey = <optional-preshared-key>
+Endpoint = <server-host-or-ip>:51820
+
+# *** The line that makes or breaks this setup ***
+# Route ONLY the chartplotter's subnet through the tunnel. The relay's target
+# (MFD_IP in docker-compose.yml, default 192.168.0.1) MUST fall inside this
+# range. Do NOT use 0.0.0.0/0 here — a full tunnel routes the relay's browser
+# replies into the VPN too, which can make :8080 unreachable from other hosts.
+AllowedIPs = 192.168.0.0/24
+
+# Keeps the tunnel alive through NAT; harmless to leave on.
+PersistentKeepalive = 25
