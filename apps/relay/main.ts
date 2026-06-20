@@ -14,8 +14,15 @@ const IP = Deno.args[0] ?? "192.168.0.1";
 const RTSP_PORT = 554;
 const STREAM_PATH = "/screenmirror";
 
-// NAL unit types to drop — parameter sets go out-of-band in the config message.
-const FILTER_NAL_TYPES = new Set([7, 8, 9]); // SPS, PPS, AUD
+// NAL unit types to drop before building the AVCC access unit:
+//   7 SPS, 8 PPS — sent out-of-band in the config message (avcC `description`).
+//   9 AUD        — access-unit delimiter; redundant once we frame per-AU.
+//   12 filler    — pure 0xFF padding. ffmpeg ignores it, but WebCodecs/hardware
+//                  decoders (Chromium) reject filler in an AVCC sample with
+//                  "EncodingError: Decoding error". The MFD's GStreamer encoder
+//                  emits a large filler NAL in every keyframe AU, so this is
+//                  what blanked the canvas. Strip it.
+const FILTER_NAL_TYPES = new Set([7, 8, 9, 12]);
 
 /** Convert RTP timestamp to microseconds, anchored to the first timestamp seen on this connection. */
 function makeToMicros(): (rtpTs: number, clockRate: number) => number {

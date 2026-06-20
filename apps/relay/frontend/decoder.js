@@ -28,10 +28,45 @@ function buildAvcc(sps, pps) {
 const ws = new WebSocket(`ws://${location.host}/`);
 ws.binaryType = "arraybuffer";
 
-ws.onmessage = (ev) => {
+// Pick a decoder config the browser actually supports. Firefox rejects some
+// hardwareAcceleration hints outright (throwing "encoding not supported" from
+// configure), so we probe with isConfigSupported and fall back from a
+// hardware-preferred config to a plain one before giving up.
+async function negotiateConfig(base) {
+  const candidates = [
+    { ...base, hardwareAcceleration: "prefer-hardware", optimizeForLatency: true },
+    { ...base, optimizeForLatency: true },
+    { ...base },
+  ];
+  for (const config of candidates) {
+    try {
+      const { supported } = await VideoDecoder.isConfigSupported(config);
+      if (supported) return config;
+    } catch (e) {
+      console.warn("isConfigSupported rejected a candidate:", e.message);
+    }
+  }
+  return null;
+}
+
+ws.onmessage = async (ev) => {
   if (typeof ev.data === "string") {
     const cfg = JSON.parse(ev.data);
     if (cfg.type !== "config") return;
+
+    const base = {
+      codec: cfg.codec,
+      description: buildAvcc(Uint8Array.from(cfg.sps), Uint8Array.from(cfg.pps)),
+    };
+    const config = await negotiateConfig(base);
+    if (!config) {
+      console.error(
+        `No VideoDecoder config supported for codec ${cfg.codec}. ` +
+          `This browser likely lacks H.264 WebCodecs support — try Chrome/Edge.`,
+      );
+      return;
+    }
+
     decoder = new VideoDecoder({
       output: (frame) => {
         if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
@@ -41,12 +76,7 @@ ws.onmessage = (ev) => {
       },
       error: (e) => console.error("decode error:", e),
     });
-    decoder.configure({
-      codec: cfg.codec,
-      description: buildAvcc(Uint8Array.from(cfg.sps), Uint8Array.from(cfg.pps)),
-      hardwareAcceleration: "prefer-hardware",
-      optimizeForLatency: true,
-    });
+    decoder.configure(config);
     return;
   }
 
