@@ -98,15 +98,21 @@ export class TcpTransport implements StreamTransport {
     onClose: CloseCallback,
     onError: ErrorCallback,
   ): Promise<void> {
-    // Reuse a fixed-size read buffer; .subarray() produces a view (no copy),
-    // matching Node Buffer.slice semantics (per §1 rulebook).
+    // BYOB read TRANSFERS the supplied buffer's ArrayBuffer to the resolved
+    // chunk — the original ArrayBuffer is left detached and unusable. So we
+    // must reclaim `value.buffer` for the next read rather than reusing the
+    // first buffer (which would detach after read #1, returning a zero-length
+    // view that looks like EOF — the bug that closed the socket mid-handshake).
+    // _onData consumes synchronously, so handing it a view we immediately reuse
+    // is safe and keeps the zero-copy semantics (per §1 rulebook).
     const reader = conn.readable.getReader({ mode: "byob" });
-    const buf = new ArrayBuffer(65536);
+    let buffer = new ArrayBuffer(65536);
     try {
       while (!this._closed) {
-        const { value, done } = await reader.read(new Uint8Array(buf));
+        const { value, done } = await reader.read(new Uint8Array(buffer));
         if (done || value === undefined) break; // EOF — remote closed
-        onData(value.subarray(0, value.byteLength));
+        onData(value);
+        buffer = value.buffer; // reclaim the transferred buffer for next read
       }
     } catch (err) {
       if (!this._closed) {
@@ -174,13 +180,16 @@ export class TlsTransport implements StreamTransport {
     onClose: CloseCallback,
     onError: ErrorCallback,
   ): Promise<void> {
+    // BYOB read transfers the supplied buffer; reclaim value.buffer each
+    // iteration (see TcpTransport._pump for the full rationale).
     const reader = conn.readable.getReader({ mode: "byob" });
-    const buf = new ArrayBuffer(65536);
+    let buffer = new ArrayBuffer(65536);
     try {
       while (!this._closed) {
-        const { value, done } = await reader.read(new Uint8Array(buf));
+        const { value, done } = await reader.read(new Uint8Array(buffer));
         if (done || value === undefined) break;
-        onData(value.subarray(0, value.byteLength));
+        onData(value);
+        buffer = value.buffer; // reclaim the transferred buffer for next read
       }
     } catch (err) {
       if (!this._closed) {
