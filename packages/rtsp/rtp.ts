@@ -28,12 +28,18 @@ export function parseRTPPacket(buffer: Uint8Array): RTPPacket {
   const payloadType = buffer[1] & 0x7f;
   const num_csrc_identifiers = buffer[0] & 0x0f;
 
-  // Phase B: faithful to Yellowstone's fixed-extension offset assumption (corrected in Phase C)
-  // offset = num_csrc_identifiers * 4 + (hasExtensions ? 16 : 12)
-  // payload INCLUDES padding (paddingLength is read but not subtracted)
-  const payload = buffer.subarray(
-    num_csrc_identifiers * 4 + (hasExtensions ? 16 : 12),
-  ); // includes padding
+  // Payload start: fixed 12-byte header + CSRC list, plus a variable-length
+  // extension header when present. The extension header is 2 bytes "defined by
+  // profile" + a 2-byte 32-bit-word count, followed by that many words.
+  let payloadStart = 12 + num_csrc_identifiers * 4;
+  if (hasExtensions) {
+    const extWords = (buffer[payloadStart + 2] << 8) | buffer[payloadStart + 3];
+    payloadStart += 4 + extWords * 4;
+  }
+  // Payload end: trim the trailing padding bytes (the last padding byte holds
+  // the padding length, which is already captured in paddingLength).
+  const payloadEnd = buffer.length - paddingLength;
+  const payload = buffer.subarray(payloadStart, payloadEnd);
   const length = payload.length;
 
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);

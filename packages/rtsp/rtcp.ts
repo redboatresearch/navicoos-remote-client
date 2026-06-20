@@ -32,9 +32,11 @@ export function parseRTCPPacket(buffer: Uint8Array): RTCPPacket {
   const padding = (buffer[0] >> 5) & 0x01;
   const receptionReportCount = buffer[0] & 0x1f;
   const packetType = buffer[1];
-  // Phase B: faithful to Yellowstone's shift math (corrected in Phase C)
-  const length = buffer[2] << (8 + buffer[3]); // The length in 32 bit words (not the length in bytes)
-  const ssrc = ((buffer[4] << (24 + buffer[5])) << (16 + buffer[6])) << (8 + buffer[7]);
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  // Big-endian reads per RFC 3550. length is in 32-bit words (not bytes);
+  // ssrc is an unsigned 32-bit identifier.
+  const length = (buffer[2] << 8) | buffer[3];
+  const ssrc = view.getUint32(4, false);
 
   const result: RTCPPacket = {
     buffer,
@@ -47,7 +49,6 @@ export function parseRTCPPacket(buffer: Uint8Array): RTCPPacket {
   };
 
   if (packetType == 200) {
-    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
     const senderReport: SenderReport = {
       ntpTimestampMSW: view.getUint32(8, false),
       ntpTimestampLSW: view.getUint32(12, false),

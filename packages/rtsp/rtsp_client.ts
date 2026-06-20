@@ -1,7 +1,9 @@
 /// <reference lib="deno.unstable" />
-// Phase B: faithful Deno port of Yellowstone's RTSPClient.
-// Mechanical Node→Deno substitution only — quirks preserved verbatim.
-// RFC corrections come in Phase C (a later commit).
+// Deno port of Yellowstone's RTSPClient.
+// Phase B was a mechanical Node→Deno substitution with quirks preserved verbatim;
+// Phase C layered RFC corrections on top (TextDecoder header/payload decoding and
+// anchored resync — see the _onData block). Other Yellowstone behaviors that are
+// not bugs remain faithful and are annotated inline.
 //
 // Node→Deno substitution table (§1 of plans/yellowstone-incorporation.md):
 //   net.connect / tls.connect  → TcpTransport / TlsTransport (./transport.ts)
@@ -38,9 +40,8 @@ const STATUS_UNAUTH = 401;
 
 const WWW_AUTH = "WWW-Authenticate";
 
-// Phase B: faithful to Yellowstone (corrected in Phase C)
-// WWW_AUTH_REGEX is preserved verbatim — exact same regex from Yellowstone.
-// Parsing is delegated to parseAuthChallenge() in auth.ts; prefixed _  to satisfy lint.
+// Preserved verbatim from Yellowstone for reference; parsing is delegated to
+// parseAuthChallenge() in auth.ts, so this is unused (prefixed _ to satisfy lint).
 const _WWW_AUTH_REGEX = new RegExp(
   '([a-zA-Z]+)\\s*=\\s*"?((?<=").*?(?=")|.*?(?=\\s*,?\\s*[a-zA-Z]+\\s*=)|.+[^\\s])',
   "g",
@@ -789,12 +790,12 @@ export class RtspClient extends EventEmitter {
   // -------------------------------------------------------------------------
   // _onData — port of Yellowstone's _onData(data: Buffer)
   //
-  // Phase B: faithful to Yellowstone — ReadStates state machine.
-  // Quirks preserved:
-  //   - messageBytes is number[] throughout (not Uint8Array)
-  //   - String.fromCharCode.apply(null, messageBytes) for header text decoding
-  //     (Phase B: faithful to Yellowstone — corrected in Phase C with TextDecoder)
-  //   - Unexpected-byte branch throws (Phase B: faithful; anchored resync in Phase C)
+  // ReadStates state machine (ported from Yellowstone).
+  //   - messageBytes is number[] throughout (faithful to Yellowstone)
+  //   - Header/payload text is decoded with TextDecoder (Phase C; replaces
+  //     String.fromCharCode.apply, which overflowed on large SDP bodies)
+  //   - An unexpected byte triggers an anchored resync to the next '$' or
+  //     "RTSP/" frame start (Phase C; replaces the original throw)
   // -------------------------------------------------------------------------
 
   _onData(data: Uint8Array): void {
@@ -895,9 +896,9 @@ export class RtspClient extends EventEmitter {
           this.messageBytes[this.messageBytes.length - 2] === ENDL &&
           this.messageBytes[this.messageBytes.length - 1] === ENDL
         ) {
-          // Phase B: faithful to Yellowstone — String.fromCharCode.apply for header text
-          // (corrected in Phase C with TextDecoder)
-          const text = String.fromCharCode.apply(null, this.messageBytes);
+          // Phase C: decode header bytes with TextDecoder (avoids the call-stack
+          // blow-up String.fromCharCode.apply hits on large arrays).
+          const text = new TextDecoder().decode(Uint8Array.from(this.messageBytes));
           const lines = text.split("\n");
 
           this.rtspContentLength = 0;
@@ -958,15 +959,15 @@ export class RtspClient extends EventEmitter {
         index++;
 
         if (this.messageBytes.length === this.rtspContentLength) {
-          // Phase B: faithful to Yellowstone — String.fromCharCode.apply for payload text
-          // (corrected in Phase C with TextDecoder)
-          const text = String.fromCharCode.apply(null, this.messageBytes);
+          // Phase C: decode payload bytes with TextDecoder (handles large SDP
+          // bodies that overflow String.fromCharCode.apply's argument limit).
+          const text = new TextDecoder().decode(Uint8Array.from(this.messageBytes));
           const mediaHeaders = text.split("\n");
 
           // Phase B: faithful to Yellowstone — log message duplicates body (emit body twice)
           this.emit(
             "log",
-            String.fromCharCode.apply(null, this.messageBytes) + text,
+            text + text,
             "S->C",
           );
 
@@ -974,13 +975,53 @@ export class RtspClient extends EventEmitter {
           this.readState = ReadStates.SEARCHING;
         }
       } else {
-        // Phase B: faithful to Yellowstone — unexpected data throws
-        // (corrected in Phase C with anchored resync)
-        throw new Error(
-          "Bug in RTSP data framing, please file an issue with the author with stacktrace.",
-        );
+        // Phase C: anchored resync instead of throwing on an unexpected byte.
+        // Scan forward to the next plausible frame anchor — either the '$'
+        // interleaved-data marker or the start of an "RTSP/" response line — and
+        // resume parsing there. If no anchor is found in the buffer, drop the
+        // unparseable bytes and wait for more data rather than throwing.
+        const anchor = this._findResyncAnchor(data, index);
+        if (anchor === -1) {
+          // No anchor in what we have — discard the rest and resync on next chunk.
+          index = data.length;
+        } else {
+          index = anchor;
+        }
+        this.readState = ReadStates.SEARCHING;
+        this.messageBytes = [];
       }
     } // end while
+  }
+
+  // -------------------------------------------------------------------------
+  // _findResyncAnchor — scan forward from `from` for the next plausible frame
+  // start: the '$' (0x24) interleaved-data marker, or the start of an "RTSP/"
+  // response line. Returns the index of the anchor, or -1 if none is found.
+  // -------------------------------------------------------------------------
+
+  _findResyncAnchor(data: Uint8Array, from: number): number {
+    // "RTSP/" = 0x52 0x54 0x53 0x50 0x2f
+    const RTSP_SIG = [0x52, 0x54, 0x53, 0x50, 0x2f];
+    for (let i = from; i < data.length; i++) {
+      if (data[i] === 0x24) return i; // '$' interleaved marker
+      if (data[i] === RTSP_SIG[0]) {
+        let matched = true;
+        for (let j = 1; j < RTSP_SIG.length; j++) {
+          if (i + j >= data.length) {
+            // Partial "RTSP/" at the buffer tail — anchor here (matched stays
+            // true) so the next chunk completes it rather than skipping a real
+            // response start.
+            break;
+          }
+          if (data[i + j] !== RTSP_SIG[j]) {
+            matched = false;
+            break;
+          }
+        }
+        if (matched) return i;
+      }
+    }
+    return -1;
   }
 
   // -------------------------------------------------------------------------
