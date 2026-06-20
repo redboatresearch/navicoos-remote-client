@@ -62,6 +62,60 @@ deno task lint       # lint
 deno task compile    # build a single binary (deno compile --allow-net)
 ```
 
+## Docker (relay behind a WireGuard tunnel)
+
+To reach a chartplotter on a remote LAN, the relay runs inside a container
+based on [`linuxserver/wireguard`](https://docs.linuxserver.io/images/docker-wireguard/).
+The container brings up the WireGuard client, and an s6 service runs the Deno
+relay alongside it. The relay connects to the MFD lazily — only when a browser
+opens the WebSocket — so it reaches the device *through* the tunnel.
+
+```sh
+# 1. Drop your WireGuard client config in place (any *.conf name works).
+#    Start from wg0.conf.example and fill in your peer's values:
+mkdir -p wireguard
+cp wg0.conf.example wireguard/wg0.conf
+$EDITOR wireguard/wg0.conf
+
+# 2. Set MFD_IP in docker-compose.yml to the chartplotter's address as seen
+#    through the tunnel (defaults to 192.168.0.1).
+
+# 3. Build and run:
+docker compose up --build
+
+# 4. Open the relay (secure-context requirement — use localhost, not the LAN IP):
+open http://localhost:8080
+```
+
+### Use a split-tunnel config
+
+The relay only needs to reach the chartplotter — not route all your traffic.
+Scope the peer's `AllowedIPs` to the **MFD's subnet**, and make sure `MFD_IP`
+falls inside it:
+
+```ini
+[Peer]
+AllowedIPs = 192.168.0.0/24   # the chartplotter's LAN, NOT 0.0.0.0/0
+```
+
+Why this matters: `wg-quick` uses policy-based routing. With a full tunnel
+(`0.0.0.0/0`) the only route covering the relay's *replies to your browser* is
+the tunnel's default route, so the relay's `:8080` becomes unreachable from
+other machines on your LAN (it still works from `localhost` on the Docker
+host). A split tunnel adds a route only for the MFD subnet via `wg0` and leaves
+everything else on `eth0`, so the port stays reachable everywhere. This was
+verified against the container: `192.168.0.1` routes via `wg0`, `1.1.1.1` stays
+on `eth0`. See [`wg0.conf.example`](./wg0.conf.example).
+
+The `wireguard/` directory and any `*.conf` files are git-ignored and excluded
+from the build context — your keys never end up in the image. The config is
+mounted read-only at `/config/wg_confs/` at runtime. To target a different
+device without rebuilding, override the env var:
+
+```sh
+MFD_IP=10.0.0.5 docker compose up --build   # or edit docker-compose.yml
+```
+
 ## Legacy Python client
 
 The original native macOS remote display + control client lives in

@@ -1,0 +1,25 @@
+services:
+  relay:
+    build: .
+    image: navicoos-remote-client
+    container_name: navicoos-relay
+    # WireGuard needs to manage interfaces/routes inside the container.
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE   # only used if the host lacks a loaded wireguard module
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    environment:
+      # IP of the chartplotter as reachable *through* the tunnel.
+      - MFD_IP=192.168.129.4
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      # Drop your client config here as wg0.conf (see README "Docker" section).
+      - ./wireguard:/config/wg_confs:ro
+      # Needed on hosts where the wireguard kernel module is built-in.
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "8080:8080"   # relay HTTP/WebSocket -> open http://localhost:8080
+    restart: unless-stopped

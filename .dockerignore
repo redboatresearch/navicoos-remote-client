@@ -1,0 +1,13 @@
+# Build context: ship only the Deno workspace. Keep secrets and cruft out.
+.git
+reference-client/
+plans/
+scripts/
+wireguard/
+*.conf
+.env
+.deno/
+vendor/
+.DS_Store
+**/.DS_Store
+README.md
