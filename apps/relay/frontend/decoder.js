@@ -4,7 +4,19 @@
 
 const canvas = document.getElementById("video");
 const ctx = canvas.getContext("2d");
+
 let decoder = null;
+let description = null; // avcC bytes — parameter sets carried out-of-band
+let codecString = null;
+let forcedSoftware = false; // set once we downgrade after a hardware decode error
+let waitingForKey = true; // after each (re)configure, drop deltas until a keyframe
+
+// --- diagnostics ---------------------------------------------------------
+let chosenHint = null; // hardwareAcceleration hint that isConfigSupported accepted
+let decodeCalls = 0; // chunks handed to decoder.decode()
+let framesOut = 0; // frames the decoder actually produced
+let last = null; // last chunk we tried: { isKey, size, ts }
+const log = (...a) => console.log("[decoder]", ...a);
 
 function buildAvcc(sps, pps) {
   const out = new Uint8Array(11 + sps.length + pps.length);
@@ -25,58 +37,94 @@ function buildAvcc(sps, pps) {
   return out;
 }
 
-const ws = new WebSocket(`ws://${location.host}/`);
-ws.binaryType = "arraybuffer";
+const onFrame = (frame) => {
+  framesOut++;
+  if (framesOut === 1) {
+    log(`first frame decoded: ${frame.displayWidth}x${frame.displayHeight} (hint=${chosenHint})`);
+  }
+  if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
+  if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
+  ctx.drawImage(frame, 0, 0);
+  frame.close(); // release the hardware buffer — mandatory
+};
 
-// Pick a decoder config the browser actually supports. Firefox rejects some
-// hardwareAcceleration hints outright (throwing "encoding not supported" from
-// configure), so we probe with isConfigSupported and fall back from a
-// hardware-preferred config to a plain one before giving up.
-async function negotiateConfig(base) {
+// A VideoDecoder error closes the decoder permanently. Chrome's hardware path
+// (VideoToolbox) can pass isConfigSupported and then fail HERE at decode time
+// on a stream that software decoders handle fine. So on the first error,
+// rebuild the decoder forcing software and resync from the next keyframe.
+const onError = (e) => {
+  console.error("[decoder] DECODE ERROR", {
+    name: e.name,
+    message: e.message,
+    state: decoder && decoder.state,
+    hint: chosenHint,
+    forcedSoftware,
+    decodeCalls,
+    framesOut,
+    lastChunk: last,
+    codec: codecString,
+  });
+  if (!forcedSoftware) {
+    forcedSoftware = true;
+    console.warn("[decoder] hardware decode failed — rebuilding in software, resync on next keyframe");
+    startDecoder();
+  } else {
+    console.error("[decoder] software decode ALSO failed — no further fallback");
+  }
+};
+
+// Pick a config the browser actually supports. Firefox rejects some
+// hardwareAcceleration hints outright (throwing from isConfigSupported), so we
+// probe and fall back from the preferred accel hint to a plain config.
+async function pickConfig() {
+  const base = { codec: codecString, description };
+  const hint = forcedSoftware ? "prefer-software" : "prefer-hardware";
   const candidates = [
-    { ...base, hardwareAcceleration: "prefer-hardware", optimizeForLatency: true },
+    { ...base, hardwareAcceleration: hint, optimizeForLatency: true },
     { ...base, optimizeForLatency: true },
     { ...base },
   ];
   for (const config of candidates) {
     try {
       const { supported } = await VideoDecoder.isConfigSupported(config);
-      if (supported) return config;
+      log(`isConfigSupported(hint=${config.hardwareAcceleration ?? "none"}) -> ${supported}`);
+      if (supported) {
+        chosenHint = config.hardwareAcceleration ?? "none";
+        return config;
+      }
     } catch (e) {
-      console.warn("isConfigSupported rejected a candidate:", e.message);
+      console.warn("[decoder] isConfigSupported rejected a candidate:", e.message);
     }
   }
   return null;
 }
 
-ws.onmessage = async (ev) => {
+async function startDecoder() {
+  const config = await pickConfig();
+  if (!config) {
+    console.error(
+      `No VideoDecoder config supported for codec ${codecString}. ` +
+        `This browser may lack H.264 WebCodecs support — try Chrome, Edge, or Firefox.`,
+    );
+    return;
+  }
+  decoder = new VideoDecoder({ output: onFrame, error: onError });
+  decoder.configure(config);
+  waitingForKey = true; // the first chunk after (re)configure must be a keyframe
+  log(`configured: codec=${codecString} hint=${chosenHint} state=${decoder.state}`);
+}
+
+const ws = new WebSocket(`ws://${location.host}/`);
+ws.binaryType = "arraybuffer";
+
+ws.onmessage = (ev) => {
   if (typeof ev.data === "string") {
     const cfg = JSON.parse(ev.data);
     if (cfg.type !== "config") return;
-
-    const base = {
-      codec: cfg.codec,
-      description: buildAvcc(Uint8Array.from(cfg.sps), Uint8Array.from(cfg.pps)),
-    };
-    const config = await negotiateConfig(base);
-    if (!config) {
-      console.error(
-        `No VideoDecoder config supported for codec ${cfg.codec}. ` +
-          `This browser likely lacks H.264 WebCodecs support — try Chrome/Edge.`,
-      );
-      return;
-    }
-
-    decoder = new VideoDecoder({
-      output: (frame) => {
-        if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
-        if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
-        ctx.drawImage(frame, 0, 0);
-        frame.close(); // release the hardware buffer — mandatory
-      },
-      error: (e) => console.error("decode error:", e),
-    });
-    decoder.configure(config);
+    codecString = cfg.codec;
+    description = buildAvcc(Uint8Array.from(cfg.sps), Uint8Array.from(cfg.pps));
+    forcedSoftware = false;
+    startDecoder();
     return;
   }
 
@@ -86,13 +134,21 @@ ws.onmessage = async (ev) => {
   const ts = Number(new DataView(buf.buffer).getBigUint64(1, false));
   const data = buf.subarray(9);
 
+  // A freshly (re)configured decoder must start at a keyframe.
+  if (waitingForKey) {
+    if (!isKey) return;
+    waitingForKey = false;
+    log(`resync: first chunk after configure is key, size=${data.length} ts=${ts}`);
+  }
   if (decoder.decodeQueueSize > 5 && !isKey) return; // backpressure: shed deltas
 
-  decoder.decode(
-    new EncodedVideoChunk({
-      type: isKey ? "key" : "delta",
-      timestamp: ts,
-      data,
-    }),
-  );
+  last = { isKey, size: data.length, ts };
+  decodeCalls++;
+  try {
+    decoder.decode(new EncodedVideoChunk({ type: isKey ? "key" : "delta", timestamp: ts, data }));
+  } catch (e) {
+    // decode() throws synchronously if the decoder just closed on error;
+    // onError handles the rebuild, so just swallow it here.
+    console.warn("decode() threw:", e.message);
+  }
 };
